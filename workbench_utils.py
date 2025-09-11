@@ -1935,8 +1935,7 @@ def check_input(config, args):
             "task",
             "host",
             "username",
-            "password",
-            "media_type",
+            "password"
         ]
         for add_media_required_option in add_media_required_options:
             if add_media_required_option not in config_keys:
@@ -1953,8 +1952,7 @@ def check_input(config, args):
             "host",
             "username",
             "password",
-            "input_csv",
-            "media_type",
+            "input_csv"
         ]
         for update_media_required_option in update_media_required_options:
             if update_media_required_option not in config_keys:
@@ -2192,36 +2190,6 @@ def check_input(config, args):
     else:
         csv_column_headers = csv_data.fieldnames
 
-    if config["task"] in ["add_media", "update_media"]:
-        field_definitions = get_field_definitions(config, "media", config["media_type"])
-        base_media_fields = ["status", "uid", "langcode"]
-        drupal_fieldnames = []
-        for drupal_fieldname in field_definitions:
-            drupal_fieldnames.append(drupal_fieldname)
-
-        for csv_column_header in csv_column_headers:
-            if (
-                csv_column_header not in drupal_fieldnames
-                and csv_column_header != "media_id"
-                and csv_column_header != "file"
-                and csv_column_header != "node_id"
-                and csv_column_header not in base_media_fields
-            ):
-                logging.error(
-                    "CSV column header %s does not match any Drupal field names in the %s media type",
-                    csv_column_header,
-                    config["media_type"],
-                )
-                sys.exit(
-                    'Error: CSV column header "'
-                    + csv_column_header
-                    + '" does not match any Drupal field names in the "'
-                    + config["media_type"]
-                    + '" media type.'
-                )
-        message = "OK, CSV column headers match Drupal field names."
-        print(message)
-        logging.info(message)
 
     # Check whether each row contains the same number of columns as there are headers.
     row_count = 0
@@ -3218,6 +3186,9 @@ def check_input(config, args):
         and "file" in csv_column_headers
     ):
         if (
+            config["task"] == "add_media"
+            or config["task"] == "update_media"
+            and "file" in csv_column_headers or
             config["nodes_only"] is False
             and config["paged_content_from_directories"] is False
         ):
@@ -5135,6 +5106,18 @@ def create_media(
           it doesn't have sufficient information to create the media, or None
           if config['nodes_only'] is True.
     """
+
+    def get_node_media_from_nid(config, node_id):
+        """Get node field_islandora_object_media from Drupal.
+        """
+        node_url = config['host'] + '/node/' + node_id + '?_format=json'
+        node_response = issue_request(config, 'GET', node_url)
+        if node_response.status_code == 200:
+            node_dict = json.loads(node_response.text)
+            return node_dict['field_islandora_object_media']
+        else:
+            return False
+    
     if config["nodes_only"] is True:
         return None
 
@@ -5274,7 +5257,6 @@ def create_media(
                 ],
                 "name": [{"value": media_name}],
                 media_field: [{"value": filename}],
-                "field_media_of": [{"target_id": int(node_id), "target_type": "node"}],
                 "field_media_use": [
                     {"target_id": media_use_tids[0], "target_type": "taxonomy_term"}
                 ],
@@ -5290,7 +5272,6 @@ def create_media(
                 ],
                 "name": [{"value": media_name}],
                 media_field: [{"target_id": file_result, "target_type": "file"}],
-                "field_media_of": [{"target_id": int(node_id), "target_type": "node"}],
                 "field_media_use": [
                     {"target_id": media_use_tids[0], "target_type": "taxonomy_term"}
                 ],
@@ -5560,6 +5541,65 @@ def create_media(
                         "Could not PATCH additional media use terms to media created from '%s' because media ID is not available.",
                         filename,
                     )
+
+            # Update the node reference field
+            if media_response.status_code == 201:
+
+                media_response_body = json.loads(media_response.text)
+                if 'mid' in media_response_body:
+                    media_id = media_response_body['mid'][0]['value']
+                else: 
+                    logging.error("Could not PATCH node or additional media use terms to media created from '%s' because media ID is not available.", filename)
+                    raise Exception("Unable to get media_id")
+
+                if len(media_use_tids) > 1:
+                     patch_media_use_terms(config, media_id, media_type, media_use_tids)
+                     
+                node_media_json = {
+                        'type': [
+                            {'target_id': "islandora_object"}
+                        ],
+                        'field_islandora_object_media': [
+                            {
+                                'target_id': media_id,
+                                'target_type': "media"
+                            }
+                        ]
+                    }
+
+                # If append_media is True
+                if "append_media" in config and config["append_media"] == True:
+                    node_media_list = get_node_media_from_nid(config, str(node_id))
+
+                    pruned_node_media_list = []
+                    for media_item in node_media_list:
+                        target_id = None
+                        if "target_type" in media_item:
+                            target_id = media_item["target_id"]                        
+                        target_type = None
+                        if "target_type" in media_item:
+                            target_type = media_item["target_type"]
+                        if target_id == None or target_type == None:
+                            # This is the use case where the user deletes the media, but does not remove the reference from the node
+                            if "ignore_invalid_media_reference" in config and config['ignore_invalid_media_reference'] == True:
+                                logging.warning("Invalid media reference for " + node_id)
+                            else:
+                                logging.error("Invalid media reference for " + node_id)
+                                raise Exception("Invalid media reference for " + node_id)
+                        else:
+                            pruned_node_media_list.append(media_item)
+                    
+                    if len(pruned_node_media_list) > 0:
+                        current_media = {"target_id": media_id, "target_type": 'media'}
+                        pruned_node_media_list.append(current_media)
+                        node_media_json['field_islandora_object_media'] = pruned_node_media_list
+
+                node_endpoint = config['host'] + '/node/' + str(node_id) + '?_format=json'
+                node_headers = {'Content-Type': 'application/json'}
+                node_response = issue_request(config, 'PATCH', node_endpoint, node_headers, node_media_json)
+            
+                if node_response.status_code != 200:
+                    logging.error("PATCH to the node after media was created failed.")
 
             # Execute media-specific post-create scripts, if any are configured.
             if "media_post_create" in config and len(config["media_post_create"]) > 0:
@@ -9445,22 +9485,29 @@ def get_csv_from_google_sheet(config):
         logging.error(message)
         sys.exit("Error: " + message)
 
+    # Always generate unique CSV filenames to prevent collisions when multiple workbench instances run simultaneously
+    config_file_id = get_config_file_identifier_shortened(config)
+    
+    # For secondary tasks, check if this config is in the secondary tasks list
     if os.environ.get("ISLANDORA_WORKBENCH_SECONDARY_TASKS") is not None:
         secondary_tasks = json.loads(os.environ["ISLANDORA_WORKBENCH_SECONDARY_TASKS"])
-        config_file_id = get_config_file_identifier(config)
         if os.path.abspath(config["current_config_file_path"]) in secondary_tasks:
-            config_file_id = get_config_file_identifier(config)
+            # This is a secondary task, use the secondary task naming convention
             exported_csv_path = os.path.join(
                 config["temp_dir"],
                 config["google_sheets_csv_filename"] + "." + config_file_id,
             )
         else:
+            # This is a primary task but still use unique naming to prevent collisions
             exported_csv_path = os.path.join(
-                config["temp_dir"], config["google_sheets_csv_filename"]
+                config["temp_dir"],
+                config["google_sheets_csv_filename"] + "." + config_file_id,
             )
     else:
+        # No secondary tasks environment variable set, but still use unique naming
         exported_csv_path = os.path.join(
-            config["temp_dir"], config["google_sheets_csv_filename"]
+            config["temp_dir"],
+            config["google_sheets_csv_filename"] + "." + config_file_id,
         )
 
     open(exported_csv_path, "wb+").write(response.content)
@@ -9496,21 +9543,26 @@ def get_csv_from_excel(config):
                 record[headers[x]] = row[x].value
         records.append(record)
 
+    # Always generate unique CSV filenames to prevent collisions when multiple workbench instances run simultaneously
+    config_file_id = get_config_file_identifier_shortened(config)
+    
+    # For secondary tasks, check if this config is in the secondary tasks list
     if os.environ.get("ISLANDORA_WORKBENCH_SECONDARY_TASKS") is not None:
         secondary_tasks = json.loads(os.environ["ISLANDORA_WORKBENCH_SECONDARY_TASKS"])
-        config_file_id = get_config_file_identifier(config)
         if os.path.abspath(config["current_config_file_path"]) in secondary_tasks:
-            config_file_id = get_config_file_identifier(config)
+            # This is a secondary task, use the secondary task naming convention
             exported_csv_path = os.path.join(
                 config["temp_dir"], config["excel_csv_filename"] + "." + config_file_id
             )
         else:
+            # This is a primary task but still use unique naming to prevent collisions
             exported_csv_path = os.path.join(
-                config["temp_dir"], config["excel_csv_filename"]
+                config["temp_dir"], config["excel_csv_filename"] + "." + config_file_id
             )
     else:
+        # No secondary tasks environment variable set, but still use unique naming
         exported_csv_path = os.path.join(
-            config["temp_dir"], config["excel_csv_filename"]
+            config["temp_dir"], config["excel_csv_filename"] + "." + config_file_id
         )
 
     csv_writer_file_handle = open(exported_csv_path, "w+", newline="", encoding="utf-8")
@@ -9545,11 +9597,9 @@ def get_extracted_csv_file_path(config):
     else:
         return False
 
-    if os.environ.get("ISLANDORA_WORKBENCH_SECONDARY_TASKS") is not None:
-        secondary_tasks = json.loads(os.environ["ISLANDORA_WORKBENCH_SECONDARY_TASKS"])
-        if os.path.abspath(config["current_config_file_path"]) in secondary_tasks:
-            config_file_id = get_config_file_identifier(config)
-            exported_csv_filename = exported_csv_filename + "." + config_file_id
+    # Always generate unique CSV filenames to prevent collisions when multiple workbench instances run simultaneously
+    config_file_id = get_config_file_identifier_shortened(config)
+    exported_csv_filename = exported_csv_filename + "." + config_file_id
 
     return os.path.join(config["temp_dir"], exported_csv_filename)
 
@@ -10720,6 +10770,24 @@ def get_config_file_identifier(config):
         os.path.splitext(config["current_config_file_path"])[0]
     )
     config_file_id = re.sub(r"[/\\]", "_", split_path[1].strip("/\\"))
+
+    return config_file_id
+
+def get_config_file_identifier_shortened(config):
+    """Gets a unique identifier of the current config file. Used in names of temp files, etc."""
+    """Parameters
+        ----------
+        config : dict
+            The configuration settings defined by workbench_config.get_config().
+        Returns
+        -------
+        string
+            A string based on just the config file's name (without path or extension).
+    """
+    # Extract just the filename without path and extension
+    config_file_path = config["current_config_file_path"]
+    config_file_name = os.path.basename(config_file_path)
+    config_file_id = os.path.splitext(config_file_name)[0]
 
     return config_file_id
 
